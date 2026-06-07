@@ -10,10 +10,12 @@ import {
   LogOut, 
   ShieldCheck, 
   RefreshCw,
-  Github
+  Github,
+  KeyRound
 } from "lucide-react";
 
 interface SupabaseAuthWidgetProps {
+  key?: string;
   onUserChange?: (user: any) => void;
 }
 
@@ -21,11 +23,18 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
   const [supabaseUser, setSupabaseUser] = useState<any>(null);
   const [isConfigured, setIsConfigured] = useState(false);
   const [showAuthForm, setShowAuthForm] = useState(false);
-  const [isSignUp, setIsSignUp] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "signup" | "reset">("login");
+  const isSignUp = authMode === "signup";
   const [showConfigGuide, setShowConfigGuide] = useState(false);
   
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  
+  // Stati per la gestione e creazione della nuova password
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [changePasswordLoading, setChangePasswordLoading] = useState(false);
   
   const [loading, setLoading] = useState(false);
   const [isPolling, setIsPolling] = useState(false);
@@ -38,18 +47,22 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
       intervalId = setInterval(async () => {
         const activeConfigured = getIsSupabaseConfigured();
         if (activeConfigured) {
-          const { data: { session } } = await supabase.auth.getSession();
-          if (session?.user) {
-            setIsPolling(false);
-            setMessage({ 
-              type: "success", 
-              text: "Accesso con GitHub completato con successo! Applicazione dei dati privati..." 
-            });
-            setSupabaseUser(session.user);
-            if (onUserChange) onUserChange(session.user);
-            setTimeout(() => {
-              window.location.reload();
-            }, 1200);
+          try {
+            const { data: { session } } = await supabase.auth.getSession();
+            if (session?.user) {
+              setIsPolling(false);
+              setMessage({ 
+                type: "success", 
+                text: "Accesso con GitHub completato con successo! Applicazione dei dati privati..." 
+              });
+              setSupabaseUser(session.user);
+              if (onUserChange) onUserChange(session.user);
+              setTimeout(() => {
+                window.location.reload();
+              }, 1200);
+            }
+          } catch (e) {
+            console.warn("Verifica sessione di polling fallita (probabilmente offline o configurazione incompleta):", e);
           }
         }
       }, 1200);
@@ -115,7 +128,11 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
       }
     } catch (err: any) {
       console.error(err);
-      setMessage({ type: "error", text: err.message || "Impossibile avviare l'autenticazione GitHub. Verifica che il provider sia abilitato su Supabase." });
+      let errMsg = err.message || "Impossibile avviare l'autenticazione GitHub. Verifica che il provider sia abilitato su Supabase.";
+      if (errMsg.includes("Failed to fetch") || errMsg.includes("fetch") || errMsg.includes("network")) {
+        errMsg = "Connessione di rete non riuscita (Failed to fetch) per raggiungere GitHub/Supabase Auth. Controlla la tua connessione.";
+      }
+      setMessage({ type: "error", text: errMsg });
     } finally {
       setLoading(false);
     }
@@ -127,23 +144,29 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
     setIsConfigured(activeConfigured);
 
     if (activeConfigured) {
-      // Get current session
+      // Get current session with catch block
       supabase.auth.getSession().then(({ data: { session } }) => {
         const u = session?.user ?? null;
         setSupabaseUser(u);
         if (onUserChange) onUserChange(u);
+      }).catch((err) => {
+        console.warn("Impossibile connettersi a Supabase durante l'avvio (offline o credenziali non valide):", err);
       });
 
-      // Listen for auth state changes
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-        const u = session?.user ?? null;
-        setSupabaseUser(u);
-        if (onUserChange) onUserChange(u);
-      });
+      // Listen for auth state changes (safeguarded)
+      try {
+        const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+          const u = session?.user ?? null;
+          setSupabaseUser(u);
+          if (onUserChange) onUserChange(u);
+        });
 
-      return () => {
-        subscription.unsubscribe();
-      };
+        return () => {
+          subscription.unsubscribe();
+        };
+      } catch (e) {
+        console.warn("Errore all'ascolto delle modifice dello stato di registrazione:", e);
+      }
     }
   }, [onUserChange]);
 
@@ -177,7 +200,11 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
       }
     } catch (err: any) {
       console.error(err);
-      setMessage({ type: "error", text: err.message || "Si è verificato un errore durante l'autenticazione." });
+      let errMsg = err.message || "Si è verificato un errore durante l'autenticazione.";
+      if (errMsg.includes("Failed to fetch") || errMsg.includes("fetch") || errMsg.includes("network")) {
+        errMsg = "Connessione di rete non riuscita o Supabase offline. Verifica le impostazioni o riprova con le credenziali corrette.";
+      }
+      setMessage({ type: "error", text: errMsg });
     } finally {
       setLoading(false);
     }
@@ -191,6 +218,63 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
     } catch (err: any) {
       console.error(err);
       setMessage({ type: "error", text: "Errore durante la disconnessione." });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newPassword) {
+      setMessage({ type: "error", text: "Inserisci una nuova password." });
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setMessage({ type: "error", text: "Le password non coincidono." });
+      return;
+    }
+    if (newPassword.length < 6) {
+      setMessage({ type: "error", text: "La password deve essere ad almeno 6 caratteri." });
+      return;
+    }
+
+    setChangePasswordLoading(true);
+    setMessage(null);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      if (error) throw error;
+      setMessage({ type: "success", text: "Password dell'account database aggiornata con successo!" });
+      setNewPassword("");
+      setConfirmPassword("");
+      setShowChangePassword(false);
+    } catch (err: any) {
+      console.error(err);
+      setMessage({ type: "error", text: err.message || "Impossibile aggiornare la password." });
+    } finally {
+      setChangePasswordLoading(false);
+    }
+  };
+
+  const handleResetPassword = async () => {
+    if (!email) {
+      setMessage({ type: "error", text: "Inserisci la tua email per richiedere il link di ripristino password." });
+      return;
+    }
+    setLoading(true);
+    setMessage(null);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: window.location.origin,
+      });
+      if (error) throw error;
+      setMessage({ type: "success", text: "Email di ripristino password inviata! Controlla la tua casella di posta per configurare una nuova password." });
+    } catch (err: any) {
+      console.error(err);
+      let errMsg = err.message || "Impossibile inviare l'email di ripristino password.";
+      if (errMsg.includes("Failed to fetch") || errMsg.includes("fetch") || errMsg.includes("network")) {
+        errMsg = "Errore di connessione (Failed to fetch). Questo accade se l'URL del tuo database Supabase non è configurato o non è raggiungibile. Verifica i Segreti / Variabili d'ambiente in AI Studio.";
+      }
+      setMessage({ type: "error", text: errMsg });
     } finally {
       setLoading(false);
     }
@@ -278,6 +362,70 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
                   <strong>Row Level Security Attivo:</strong> i record creati saranno salvati e visibili solo al tuo utente (<code className="font-mono text-[10px]">{supabaseUser.id.substring(0, 8)}...</code>).
                 </span>
               </div>
+
+              {/* Sezione Creazione / Cambio Password del Database */}
+              <div className="border border-slate-100 rounded-2xl p-4.5 space-y-3 bg-slate-50 transition-all hover:shadow-sm">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <KeyRound className="w-4.5 h-4.5 text-indigo-600 animate-pulse" />
+                    <span className="text-xs font-extrabold text-slate-800">Password Database / Account</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowChangePassword(!showChangePassword);
+                      setMessage(null);
+                    }}
+                    className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer underline decoration-dotted"
+                  >
+                    {showChangePassword ? "Nascondi" : "Imposta / Cambia Password"}
+                  </button>
+                </div>
+
+                {showChangePassword && (
+                  <form onSubmit={handleChangePassword} className="space-y-3 pt-1 animate-fadeIn">
+                    <p className="text-[10px] text-slate-500 font-medium leading-relaxed">
+                      Imposta o aggiorna la password di accesso per la tua email attuale (<code className="font-semibold font-mono text-[9px]">{supabaseUser.email}</code>). In questo modo, se hai effettuato l'accesso con GitHub, potrai accedere anche inserendo manualmente email e password dal pannello.
+                    </p>
+                    <div className="space-y-2">
+                      <div className="relative">
+                        <Lock className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400" />
+                        <input
+                          type="password"
+                          required
+                          placeholder="Nuova password (almeno 6 caratteri)..."
+                          value={newPassword}
+                          onChange={(e) => setNewPassword(e.target.value)}
+                          className="w-full text-xs font-sans font-medium pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-xl focus:border-indigo-500 focus:outline-none"
+                        />
+                      </div>
+                      <div className="relative">
+                        <Lock className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400" />
+                        <input
+                          type="password"
+                          required
+                          placeholder="Conferma la nuova password..."
+                          value={confirmPassword}
+                          onChange={(e) => setConfirmPassword(e.target.value)}
+                          className="w-full text-xs font-sans font-medium pl-9 pr-3 py-2 bg-white border border-slate-200 rounded-xl focus:border-indigo-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={changePasswordLoading}
+                      className="w-full text-[11px] font-bold bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-xl transition-all flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-sm"
+                    >
+                      {changePasswordLoading ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <KeyRound className="w-3.5 h-3.5" />
+                      )}
+                      Salva Password Database
+                    </button>
+                  </form>
+                )}
+              </div>
             </div>
           ) : (
             // Anonymous State
@@ -305,13 +453,157 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
               </div>
 
               {showAuthForm && (
-                <form onSubmit={handleAuth} className="space-y-3.5 p-4 bg-white border border-slate-100 rounded-2xl shadow-sm">
-                  <h4 className="font-extrabold text-xs text-slate-800 tracking-tight">
-                    {isSignUp ? "Crea un nuovo account" : "Accedi al tuo account privato"}
-                  </h4>
+                <div className="space-y-4 p-5 bg-white border border-slate-100 rounded-2xl shadow-sm">
+                  {/* Tab Selector Buttons */}
+                  <div className="flex border-b border-slate-100 pb-1.5 justify-between">
+                    <button
+                      type="button"
+                      onClick={() => { setAuthMode("login"); setMessage(null); }}
+                      className={`flex-1 text-center pb-2 text-[11px] font-extrabold tracking-tight transition-all border-b-2 cursor-pointer ${
+                        authMode === "login"
+                          ? "border-indigo-600 text-indigo-600"
+                          : "border-transparent text-slate-400 hover:text-slate-600"
+                      }`}
+                    >
+                      Accedi
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setAuthMode("signup"); setMessage(null); }}
+                      className={`flex-1 text-center pb-2 text-[11px] font-extrabold tracking-tight transition-all border-b-2 cursor-pointer ${
+                        authMode === "signup"
+                          ? "border-indigo-600 text-indigo-600"
+                          : "border-transparent text-slate-400 hover:text-slate-600"
+                      }`}
+                    >
+                      Registrati
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setAuthMode("reset"); setMessage(null); }}
+                      className={`flex-1 text-center pb-2 text-[11px] font-extrabold tracking-tight transition-all border-b-2 cursor-pointer ${
+                        authMode === "reset"
+                          ? "border-indigo-600 text-indigo-600"
+                          : "border-transparent text-slate-400 hover:text-slate-600"
+                      }`}
+                    >
+                      Password via Email
+                    </button>
+                  </div>
 
-                  {/* GitHub Auth Option */}
-                  <div className="pt-1.5 space-y-3">
+                  {/* Mode 1 & 2: Accedi (Login) or Registrati (Signup) */}
+                  {(authMode === "login" || authMode === "signup") && (
+                    <form onSubmit={handleAuth} className="space-y-4">
+                      <div className="space-y-2.5">
+                        <div className="relative">
+                          <Mail className="absolute left-3.5 top-3 w-4 h-4 text-slate-400" />
+                          <input
+                            type="email"
+                            required
+                            placeholder="Inserisci la tua email..."
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            className="w-full text-xs font-sans font-medium pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl focus:border-indigo-500 focus:outline-none focus:bg-white transition-all"
+                          />
+                        </div>
+
+                        <div className="relative">
+                          <Lock className="absolute left-3.5 top-3 w-4 h-4 text-slate-400" />
+                          <input
+                            type="password"
+                            required
+                            placeholder="Inserisci la password..."
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            className="w-full text-xs font-sans font-medium pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl focus:border-indigo-500 focus:outline-none focus:bg-white transition-all"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-between pt-1 pb-1">
+                        {authMode === "login" && (
+                          <button
+                            type="button"
+                            onClick={() => { setAuthMode("reset"); setMessage(null); }}
+                            className="text-[10px] text-slate-500 hover:text-indigo-600 text-left font-semibold cursor-pointer underline decoration-dotted"
+                          >
+                            Non ricordi la password / creane una nuova →
+                          </button>
+                        )}
+                        {authMode === "signup" && (
+                          <div className="text-[10px] text-slate-400 font-medium font-sans">
+                            Minimo 6 caratteri
+                          </div>
+                        )}
+
+                        <button
+                          type="submit"
+                          disabled={loading}
+                          className="text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl transition-all flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shrink-0 ml-auto shadow-sm"
+                        >
+                          {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                          {authMode === "signup" ? "Registrati" : "Accedi"}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {/* Mode 3: Reset / Password Setup via Email Link */}
+                  {authMode === "reset" && (
+                    <div className="space-y-4 pt-1">
+                      <div className="p-3 bg-indigo-50/50 rounded-xl text-[11px] text-slate-600 leading-relaxed font-sans font-medium">
+                        <strong>Opzione di Ripristino/Creazione Password via Email:</strong>
+                        <p className="mt-1">
+                          Inserisci la tua email qui sotto e clicca per inviare. Riceverai un link ufficiale di Supabase per impostare una nuova password per il tuo account.
+                        </p>
+                      </div>
+
+                      <div className="relative">
+                        <Mail className="absolute left-3.5 top-3 w-4 h-4 text-slate-400" />
+                        <input
+                          type="email"
+                          required
+                          placeholder="Inserisci la tua email (es. mauro.druskovic@gmail.com)..."
+                          value={email}
+                          onChange={(e) => setEmail(e.target.value)}
+                          className="w-full text-xs font-sans font-medium pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl focus:border-indigo-500 focus:outline-none focus:bg-white transition-all"
+                        />
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleResetPassword}
+                        disabled={loading}
+                        className="w-full text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white py-2.5 rounded-xl transition-all flex items-center justify-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shadow-sm"
+                      >
+                        {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                        Invia la Mail per Impostare la Password
+                      </button>
+
+                      <div className="text-center">
+                        <button
+                          type="button"
+                          onClick={() => setAuthMode("login")}
+                          className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                        >
+                          Se n'è occupato? Torna all'accesso
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* GitHub Alternative Auth option */}
+                  <div className="pt-2 space-y-3 border-t border-slate-100">
+                    <div className="flex items-center gap-3">
+                      <div className="h-px bg-slate-100 flex-1"></div>
+                      <span className="text-[9px] uppercase font-bold text-slate-400 tracking-wider">Metodo Alternativo</span>
+                      <div className="h-px bg-slate-100 flex-1"></div>
+                    </div>
+
+                    <p className="text-[10px] text-slate-400 text-center font-sans font-medium leading-relaxed">
+                      Se l'autenticazione tramite password riscontra problemi di rete locali, puoi usare GitHub come accesso alternativo.
+                    </p>
+
                     <button
                       type="button"
                       onClick={handleGitHubSignIn}
@@ -332,7 +624,7 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
                         onClick={() => setShowConfigGuide(!showConfigGuide)}
                         className="text-[10px] text-slate-500 underline font-medium hover:text-indigo-600 transition-colors cursor-pointer"
                       >
-                        {showConfigGuide ? "Nascondi guida configurazione Supabase" : "Problemi o prima configurazione? Clicca per la guida →"}
+                        {showConfigGuide ? "Nascondi guida configurazione Supabase" : "Problemi o prima configurazione GitHub? Clicca qui →"}
                       </button>
                     </div>
 
@@ -362,59 +654,8 @@ export default function SupabaseAuthWidget({ onUserChange }: SupabaseAuthWidgetP
                         </ol>
                       </div>
                     )}
-
-                    <div className="flex items-center gap-3 py-1">
-                      <div className="h-px bg-slate-100 flex-1"></div>
-                      <span className="text-[9px] uppercase font-bold text-slate-400">oppure con email e password</span>
-                      <div className="h-px bg-slate-100 flex-1"></div>
-                    </div>
                   </div>
-
-                  <div className="space-y-2.5">
-                    <div className="relative">
-                      <Mail className="absolute left-3.5 top-2.5 w-4 h-4 text-slate-400" />
-                      <input
-                        type="email"
-                        required
-                        placeholder="Inserisci la tua email..."
-                        value={email}
-                        onChange={(e) => setEmail(e.target.value)}
-                        className="w-full text-xs font-sans font-medium pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl focus:border-indigo-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <div className="relative">
-                      <Lock className="absolute left-3.5 top-2.5 w-4 h-4 text-slate-400" />
-                      <input
-                        type="password"
-                        required
-                        placeholder="Inserisci la password..."
-                        value={password}
-                        onChange={(e) => setPassword(e.target.value)}
-                        className="w-full text-xs font-sans font-medium pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-100 rounded-xl focus:border-indigo-500 focus:outline-none"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex items-center justify-between pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setIsSignUp(!isSignUp)}
-                      className="text-[11px] font-bold text-slate-500 hover:text-slate-700 cursor-pointer"
-                    >
-                      {isSignUp ? "Hai già un account? Accedi" : "Non hai un account? Registrati"}
-                    </button>
-
-                    <button
-                      type="submit"
-                      disabled={loading}
-                      className="text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl transition-all flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-                    >
-                      {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-                      {isSignUp ? "Registrati" : "Accedi"}
-                    </button>
-                  </div>
-                </form>
+                </div>
               )}
             </div>
           )}

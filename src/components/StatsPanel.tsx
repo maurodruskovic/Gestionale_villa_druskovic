@@ -1117,7 +1117,7 @@ export default function StatsPanel({ reservations, settings, expenses }: StatsPa
                     </tr>
                   ))}
                   <tr className="border-t-2 border-slate-300 font-bold bg-slate-50">
-                    <td colspan="3" className="p-2 text-right">SOMMA SPESE GESTIONE:</td>
+                    <td colSpan={3} className="p-2 text-right">SOMMA SPESE GESTIONE:</td>
                     <td className="p-2 text-right font-black font-mono">-€{totalExpensesYear.toFixed(2)}</td>
                   </tr>
                 </tbody>

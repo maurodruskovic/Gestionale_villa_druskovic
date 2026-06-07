@@ -244,21 +244,24 @@ export default function App() {
         } else {
           // Standard traditional File System JSON / API operations
           console.log("Uso la persistenza API locale.");
-          const [resFetch, settingsFetch, expensesFetch] = await Promise.all([
-            fetch("/api/reservations"),
-            fetch("/api/settings"),
-            fetch("/api/expenses")
+          
+          const safeFetch = async (url: string, defaultValue: any) => {
+            try {
+              const res = await fetch(url);
+              if (res.ok) {
+                return await res.json();
+              }
+            } catch (err) {
+              console.warn(`Dispositivo offline o server non raggiungibile per la rotta ${url}:`, err);
+            }
+            return defaultValue;
+          };
+
+          const [srvRes, srvSets, srvExp] = await Promise.all([
+            safeFetch("/api/reservations", []),
+            safeFetch("/api/settings", null),
+            safeFetch("/api/expenses", [])
           ]);
-
-          let srvRes: Reservation[] = [];
-          let srvSets: Settings | null = null;
-          let srvExp: Expense[] = [];
-
-          if (resFetch.ok && settingsFetch.ok && expensesFetch.ok) {
-            srvRes = await resFetch.json();
-            srvSets = await settingsFetch.json();
-            srvExp = await expensesFetch.json();
-          }
 
           // Detect local browser backups
           const backupResStr = localStorage.getItem("backup_reservations");
@@ -402,12 +405,13 @@ export default function App() {
             setIsSyncingDrive(false);
           })
           .catch((err) => {
-            console.error("Automatic Google Drive backup failed:", err);
             setIsSyncingDrive(false);
             if (err.message === "SESSION_EXPIRED") {
+              console.warn("Automatic Google Drive backup suspended: SESSION_EXPIRED (needs Google login renew)");
               setDriveSyncError("Sessione scaduta");
               setDriveToken(null);
             } else {
+              console.error("Automatic Google Drive backup failed:", err);
               setDriveSyncError("Errore salvataggio");
             }
           });
@@ -1409,7 +1413,7 @@ export default function App() {
             {/* TAB 5: SPLIT RATIOS SETTINGS */}
             {activeTab === "settings" && (
               <div className="max-w-xl mx-auto py-6 space-y-6">
-                <SupabaseAuthWidget onUserChange={(user) => setSupabaseUser(user)} />
+                <SupabaseAuthWidget key={isSupabaseActive ? "configured" : "not-configured"} onUserChange={(user) => setSupabaseUser(user)} />
                 <DriveBackupWidget
                   reservations={reservations}
                   expenses={expenses}

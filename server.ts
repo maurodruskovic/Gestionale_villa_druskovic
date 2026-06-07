@@ -149,8 +149,8 @@ function getGeminiClient(): GoogleGenAI | null {
 // Expose Supabase settings dynamically to the frontend
 app.get("/api/config", (req, res) => {
   res.json({
-    supabaseUrl: process.env.SUPABASE_URL || "",
-    supabasePublishableKey: process.env.SUPABASE_PUBLISHABLE_KEY || ""
+    supabaseUrl: process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "",
+    supabasePublishableKey: process.env.SUPABASE_PUBLISHABLE_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY || ""
   });
 });
 
