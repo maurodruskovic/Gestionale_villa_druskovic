@@ -1,0 +1,6 @@
+{
+  "name": "Gestione Prenotazioni Villa",
+  "description": "Applicazione condivisa per la gestione di prenotazioni, check-in, servizi extra e calcolo delle commissioni per la villa di famiglia.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

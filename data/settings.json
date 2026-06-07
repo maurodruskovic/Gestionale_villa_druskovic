@@ -1,0 +1,35 @@
+{
+  "valneaPlatformCommissionPercentage": 18,
+  "valneaOwnerPercentage": 85,
+  "valneaAgentPercentage": 15,
+  "valneaPlatformCommissionTaxPercentage": 25,
+  "channels": [
+    {
+      "id": "valnea",
+      "name": "Valnea",
+      "type": "gross",
+      "commissionPercentage": 18,
+      "commissionTaxPercentage": 25,
+      "ownerPercentage": 85,
+      "agentPercentage": 15
+    },
+    {
+      "id": "novasol",
+      "name": "Novasol CLS574",
+      "type": "net",
+      "commissionPercentage": 0,
+      "commissionTaxPercentage": 0,
+      "ownerPercentage": 100,
+      "agentPercentage": 0
+    },
+    {
+      "id": "famiglia",
+      "name": "Famiglia",
+      "type": "net",
+      "commissionPercentage": 0,
+      "commissionTaxPercentage": 0,
+      "ownerPercentage": 100,
+      "agentPercentage": 0
+    }
+  ]
+}
