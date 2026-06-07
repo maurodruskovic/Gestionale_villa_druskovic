@@ -10,6 +10,18 @@ import VillaDetailsPanel from "./components/VillaDetailsPanel";
 import DriveBackupWidget from "./components/DriveBackupWidget";
 import { getAccessToken, syncAllDataToDrive } from "./lib/googleDriveSync";
 import { 
+  supabase, 
+  configureSupabase, 
+  getIsSupabaseConfigured,
+  mapReservationToModel, 
+  mapReservationToDB, 
+  mapExpenseToModel, 
+  mapExpenseToDB, 
+  mapSettingsToModel, 
+  mapSettingsToDB 
+} from "./lib/supabaseClient";
+import SupabaseAuthWidget from "./components/SupabaseAuthWidget";
+import { 
   Calendar, 
   BarChart3, 
   Sliders, 
@@ -57,6 +69,8 @@ export default function App() {
   const [driveToken, setDriveToken] = useState<string | null>(getAccessToken());
   const [isSyncingDrive, setIsSyncingDrive] = useState(false);
   const [driveSyncError, setDriveSyncError] = useState<string | null>(null);
+  const [supabaseUser, setSupabaseUser] = useState<any>(null);
+  const [isSupabaseActive, setIsSupabaseActive] = useState(false);
   
   // Selection states
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
@@ -99,86 +113,210 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterSource, setFilterSource] = useState<string>("all");
 
-  // Load reservations, settings and expenses on mount with local-backup sync recovery
+  // Check if we are inside a Supabase OAuth callback popup
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.opener && (window.location.hash.includes("access_token=") || window.location.search.includes("code="))) {
+      const timer = setTimeout(() => {
+        try {
+          window.opener.postMessage({ type: "OAUTH_AUTH_SUCCESS" }, window.location.origin);
+          window.close();
+        } catch (e) {
+          console.error("Errore nell'inviare il messaggio postMessage alla finestra principale:", e);
+        }
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  // Load reservations, settings and expenses on mount with local-backup sync recovery and Supabase integration
   useEffect(() => {
     async function initFetch() {
       try {
         setLoading(true);
-        const [resFetch, settingsFetch, expensesFetch] = await Promise.all([
-          fetch("/api/reservations"),
-          fetch("/api/settings"),
-          fetch("/api/expenses")
-        ]);
+        setError(null);
 
-        let resData: Reservation[] = [];
-        let settingsData: Settings | null = null;
-        let expensesData: Expense[] = [];
-
-        if (resFetch.ok && settingsFetch.ok && expensesFetch.ok) {
-          resData = await resFetch.json();
-          settingsData = await settingsFetch.json();
-          expensesData = await expensesFetch.json();
+        // Fetch Supabase configuration from Express backend
+        let sUrl = "";
+        let sKey = "";
+        try {
+          const configRes = await fetch("/api/config");
+          if (configRes.ok) {
+            const configData = await configRes.json();
+            sUrl = configData.supabaseUrl;
+            sKey = configData.supabasePublishableKey;
+          }
+        } catch (e) {
+          console.error("Errore fetch config:", e);
         }
 
-        // Detect local browser backups
-        const backupResStr = localStorage.getItem("backup_reservations");
-        const backupExpStr = localStorage.getItem("backup_expenses");
-        const backupSetStr = localStorage.getItem("backup_settings");
+        const isConfigured = !!sUrl && !!sKey && 
+                             sUrl.trim() !== "" && 
+                             sKey.trim() !== "" && 
+                             !sUrl.includes("placeholder") && 
+                             !sUrl.includes("la-tua-url") &&
+                             !sUrl.includes("YOUR_SUPABASE_URL") &&
+                             (sUrl.startsWith("http://") || sUrl.startsWith("https://"));
+        setIsSupabaseActive(isConfigured);
 
-        let finalReservations = resData;
-        let finalExpenses = expensesData;
-        let finalSettings = settingsData || settings;
+        let finalReservations: Reservation[] = [];
+        let finalExpenses: Expense[] = [];
+        let finalSettings: Settings = settings;
 
-        // Auto-recover logic: If local backup has MORE entries than server (which suggests a server reset)
-        if (backupResStr) {
-          try {
-            const backupRes = JSON.parse(backupResStr) as Reservation[];
-            if (Array.isArray(backupRes) && backupRes.length > resData.length) {
-              console.log("Rilevato backup locale con più dati per prenotazioni! Sincronizzazione in corso...");
-              finalReservations = backupRes;
-              // Push missing items back to server block without throwing errors
-              for (const r of backupRes) {
-                if (!resData.some(sr => sr.id === r.id)) {
-                  await fetch("/api/reservations", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(r)
-                  }).catch(e => console.error("Sync backup reservation error:", e));
-                }
+        if (isConfigured) {
+          configureSupabase(sUrl, sKey);
+          console.log("Supabase configurato ed attivato.");
+
+          // 1. Fetch from Supabase
+          const { data: dbReservations, error: errRes } = await supabase.from("reservations").select("*");
+          const { data: dbExpenses, error: errExp } = await supabase.from("expenses").select("*");
+          const { data: dbSettings, error: errSet } = await supabase.from("settings").select("*").eq("id", "default").maybeSingle();
+
+          if (errRes) console.error("Errore lettura prenotazioni Supabase:", errRes);
+          if (errExp) console.error("Errore lettura spese Supabase:", errExp);
+          if (errSet) console.error("Errore lettura settings Supabase:", errSet);
+
+          const hasDbData = (dbReservations && dbReservations.length > 0) || (dbExpenses && dbExpenses.length > 0) || dbSettings;
+
+          if (hasDbData) {
+            console.log("Dati caricati con successo da Supabase.");
+            finalReservations = (dbReservations || []).map(mapReservationToModel);
+            finalExpenses = (dbExpenses || []).map(mapExpenseToModel);
+            finalSettings = dbSettings ? mapSettingsToModel(dbSettings) : settings;
+          } else {
+            console.log("Supabase è configurato ma vuoto. Avvio migrazione dei dati esistenti verso la nuvola Supabase...");
+            // Migrate server/local JSON datasets to Supabase!
+            const resFetch = await fetch("/api/reservations").catch(() => null);
+            const settingsFetch = await fetch("/api/settings").catch(() => null);
+            const expensesFetch = await fetch("/api/expenses").catch(() => null);
+
+            let resSrv: Reservation[] = resFetch && resFetch.ok ? await resFetch.json() : [];
+            let setSrv: Settings | null = settingsFetch && settingsFetch.ok ? await settingsFetch.json() : null;
+            let expSrv: Expense[] = expensesFetch && expensesFetch.ok ? await expensesFetch.json() : [];
+
+            // Offline backup storage recovery fallback
+            const backupResStr = localStorage.getItem("backup_reservations");
+            const backupExpStr = localStorage.getItem("backup_expenses");
+            const backupSetStr = localStorage.getItem("backup_settings");
+
+            if (resSrv.length === 0 && backupResStr) {
+              try { resSrv = JSON.parse(backupResStr); } catch (e) {}
+            }
+            if (expSrv.length === 0 && backupExpStr) {
+              try { expSrv = JSON.parse(backupExpStr); } catch (e) {}
+            }
+            if (!setSrv && backupSetStr) {
+              try { setSrv = JSON.parse(backupSetStr); } catch (e) {}
+            }
+
+            finalReservations = resSrv;
+            finalExpenses = expSrv;
+            finalSettings = setSrv || settings;
+
+            // Perform batch migration inserts on Supabase (optional map with current user)
+            const currentUserId = (await supabase.auth.getUser()).data.user?.id || null;
+
+            if (finalReservations.length > 0) {
+              const dbResToInsert = finalReservations.map(r => mapReservationToDB(r, currentUserId));
+              try {
+                await supabase.from("reservations").insert(dbResToInsert);
+              } catch (e) {
+                console.error("Errore migrazione prenotazioni:", e);
               }
             }
-          } catch (e) {}
-        }
-
-        if (backupExpStr) {
-          try {
-            const backupExp = JSON.parse(backupExpStr) as Expense[];
-            if (Array.isArray(backupExp) && backupExp.length > expensesData.length) {
-              console.log("Rilevato backup locale con più dati per spese! Sincronizzazione in corso...");
-              finalExpenses = backupExp;
-              for (const exp of backupExp) {
-                if (!expensesData.some(se => se.id === exp.id)) {
-                  await fetch("/api/expenses", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(exp)
-                  }).catch(e => console.error("Sync backup expense error:", e));
-                }
+            if (finalExpenses.length > 0) {
+              const dbExpToInsert = finalExpenses.map(e => mapExpenseToDB(e, currentUserId));
+              try {
+                await supabase.from("expenses").insert(dbExpToInsert);
+              } catch (e) {
+                console.error("Errore migrazione spese:", e);
               }
             }
-          } catch (e) {}
-        }
+            if (finalSettings) {
+              const dbSetToInsert = mapSettingsToDB(finalSettings, currentUserId);
+              try {
+                await supabase.from("settings").upsert(dbSetToInsert);
+              } catch (e) {
+                console.error("Errore migrazione impostazioni:", e);
+              }
+            }
+            console.log("Migrazione completata con successo su Supabase!");
+          }
+        } else {
+          // Standard traditional File System JSON / API operations
+          console.log("Uso la persistenza API locale.");
+          const [resFetch, settingsFetch, expensesFetch] = await Promise.all([
+            fetch("/api/reservations"),
+            fetch("/api/settings"),
+            fetch("/api/expenses")
+          ]);
 
-        if (backupSetStr && !settingsData) {
-          try {
-            const backupSet = JSON.parse(backupSetStr) as Settings;
-            finalSettings = backupSet;
-            await fetch("/api/settings", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(backupSet)
-            }).catch(e => console.error("Sync backup settings error:", e));
-          } catch (e) {}
+          let srvRes: Reservation[] = [];
+          let srvSets: Settings | null = null;
+          let srvExp: Expense[] = [];
+
+          if (resFetch.ok && settingsFetch.ok && expensesFetch.ok) {
+            srvRes = await resFetch.json();
+            srvSets = await settingsFetch.json();
+            srvExp = await expensesFetch.json();
+          }
+
+          // Detect local browser backups
+          const backupResStr = localStorage.getItem("backup_reservations");
+          const backupExpStr = localStorage.getItem("backup_expenses");
+          const backupSetStr = localStorage.getItem("backup_settings");
+
+          finalReservations = srvRes;
+          finalExpenses = srvExp;
+          finalSettings = srvSets || settings;
+
+          // Auto-recover logic for API fallback
+          if (backupResStr) {
+            try {
+              const backupRes = JSON.parse(backupResStr) as Reservation[];
+              if (Array.isArray(backupRes) && backupRes.length > srvRes.length) {
+                finalReservations = backupRes;
+                for (const r of backupRes) {
+                  if (!srvRes.some(sr => sr.id === r.id)) {
+                    await fetch("/api/reservations", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(r)
+                    }).catch(e => console.error("Error syncing backup res:", e));
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+
+          if (backupExpStr) {
+            try {
+              const backupExp = JSON.parse(backupExpStr) as Expense[];
+              if (Array.isArray(backupExp) && backupExp.length > srvExp.length) {
+                finalExpenses = backupExp;
+                for (const exp of backupExp) {
+                  if (!srvExp.some(se => se.id === exp.id)) {
+                    await fetch("/api/expenses", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(exp)
+                    }).catch(e => console.error("Error syncing backup exp:", e));
+                  }
+                }
+              }
+            } catch (e) {}
+          }
+
+          if (backupSetStr && !srvSets) {
+            try {
+              const backupSet = JSON.parse(backupSetStr) as Settings;
+              finalSettings = backupSet;
+              await fetch("/api/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(backupSet)
+              }).catch(e => console.error("Error syncing backup settings:", e));
+            } catch (e) {}
+          }
         }
 
         // Apply state
@@ -196,10 +334,9 @@ export default function App() {
         }
 
       } catch (err) {
-        console.error("Errore connessione server - Caricamento backup offline:", err);
-        setError("Errore server. Dati caricati in cache locale offline persistente.");
+        console.error("Errore caricamento dati - attivazione backup offline locale:", err);
+        setError("Errore di caricamento. Caricato backup cache locale.");
         
-        // Offline-first fallbacks
         const bkR = localStorage.getItem("backup_reservations");
         const bkE = localStorage.getItem("backup_expenses");
         const bkS = localStorage.getItem("backup_settings");
@@ -211,7 +348,27 @@ export default function App() {
       }
     }
     initFetch();
-  }, []);
+  }, [supabaseUser, isSupabaseActive]);
+
+  // Synchronous session listener for Auth state
+  useEffect(() => {
+    let active = true;
+    const isMock = !getIsSupabaseConfigured();
+    if (!isMock && active) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (active) setSupabaseUser(session?.user ?? null);
+      });
+
+      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+        if (active) setSupabaseUser(session?.user ?? null);
+      });
+
+      return () => {
+        active = false;
+        subscription.unsubscribe();
+      };
+    }
+  }, [isSupabaseActive]);
 
   // Sync state mutations automatically back to local-backups
   useEffect(() => {
@@ -262,21 +419,39 @@ export default function App() {
   // Handle Save Expense (Create)
   const handleSaveExpense = async (expData: Omit<Expense, 'id'>): Promise<boolean> => {
     try {
-      const response = await fetch("/api/expenses", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(expData)
-      });
-      const data = await response.json();
-      if (response.ok) {
-        setExpenses([...expenses, data]);
+      if (isSupabaseActive) {
+        const uId = supabaseUser?.id || null;
+        const newId = `exp-${Date.now()}`;
+        const newExp: Expense = { ...expData, id: newId };
+        const dbRow = mapExpenseToDB(newExp, uId);
+        
+        const { data, error: sbError } = await supabase.from("expenses").insert(dbRow).select().single();
+        if (sbError) {
+          setError(`Errore Supabase: ${sbError.message}`);
+          return false;
+        }
+        
+        const model = mapExpenseToModel(data);
+        setExpenses([...expenses, model]);
         setHasMutated(true);
         return true;
       } else {
-        setError(data.message || "Errore durante il salvataggio della spesa.");
-        return false;
+        const response = await fetch("/api/expenses", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(expData)
+        });
+        const data = await response.json();
+        if (response.ok) {
+          setExpenses([...expenses, data]);
+          setHasMutated(true);
+          return true;
+        } else {
+          setError(data.message || "Errore durante il salvataggio della spesa.");
+          return false;
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
       setError("Errore di rete durante la connessione.");
       return false;
@@ -291,15 +466,25 @@ export default function App() {
         "Sei sicuro di voler eliminare questa spesa dal registro dei flussi?",
         async () => {
           try {
-            const response = await fetch(`/api/expenses/${id}`, {
-              method: "DELETE"
-            });
-            if (response.ok) {
+            if (isSupabaseActive) {
+              const { error: sbError } = await supabase.from("expenses").delete().eq("id", id);
+              if (sbError) {
+                setError(`Errore Supabase: ${sbError.message}`);
+                return;
+              }
               setExpenses(expenses.filter((e) => e.id !== id));
               setHasMutated(true);
             } else {
-              const data = await response.json();
-              setError(data.message || "Impossibile eliminare la spesa.");
+              const response = await fetch(`/api/expenses/${id}`, {
+                method: "DELETE"
+              });
+              if (response.ok) {
+                setExpenses(expenses.filter((e) => e.id !== id));
+                setHasMutated(true);
+              } else {
+                const data = await response.json();
+                setError(data.message || "Impossibile eliminare la spesa.");
+              }
             }
           } catch (err) {
             console.error(err);
@@ -317,26 +502,43 @@ export default function App() {
     setError(null);
     try {
       const isEdit = !!editingReservation;
-      const url = isEdit ? `/api/reservations/${editingReservation.id}` : "/api/reservations";
-      const method = isEdit ? "PUT" : "POST";
-
-      const response = await fetch(url, {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(resData)
-      });
-
-      const data = await response.json();
-
-      if (response.ok) {
-        // Refresh local reservations state
+      
+      const start = new Date(resData.checkIn);
+      const end = new Date(resData.checkOut);
+      const diffTime = Math.abs(end.getTime() - start.getTime());
+      const nights = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      
+      if (isSupabaseActive) {
+        const uId = supabaseUser?.id || null;
+        const targetId = isEdit ? editingReservation.id : `res-${Date.now()}`;
+        const newModel: Reservation = {
+          ...resData,
+          id: targetId,
+          nights
+        };
+        const dbRow = mapReservationToDB(newModel, uId);
+        
+        let queryResult;
         if (isEdit) {
-          setReservations(reservations.map((r) => r.id === editingReservation.id ? data : r));
-          if (selectedReservation?.id === editingReservation.id) {
-            setSelectedReservation(data);
+          queryResult = await supabase.from("reservations").update(dbRow).eq("id", targetId).select().single();
+        } else {
+          queryResult = await supabase.from("reservations").insert(dbRow).select().single();
+        }
+        
+        const { data, error: sbError } = queryResult;
+        if (sbError) {
+          setError(`Errore Supabase: ${sbError.message}`);
+          return false;
+        }
+        
+        const savedModel = mapReservationToModel(data);
+        if (isEdit) {
+          setReservations(reservations.map((r) => r.id === targetId ? savedModel : r));
+          if (selectedReservation?.id === targetId) {
+            setSelectedReservation(savedModel);
           }
         } else {
-          setReservations([...reservations, data]);
+          setReservations([...reservations, savedModel]);
         }
         
         setHasMutated(true);
@@ -346,13 +548,41 @@ export default function App() {
         setCalendarSelectEnd("");
         return true;
       } else {
-        // Set overlapping or validation error
-        setError(data.message || "Errore durante il salvataggio della prenotazione.");
-        return false;
+        const url = isEdit ? `/api/reservations/${editingReservation.id}` : "/api/reservations";
+        const method = isEdit ? "PUT" : "POST";
+
+        const response = await fetch(url, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(resData)
+        });
+
+        const data = await response.json();
+
+        if (response.ok) {
+          if (isEdit) {
+            setReservations(reservations.map((r) => r.id === editingReservation.id ? data : r));
+            if (selectedReservation?.id === editingReservation.id) {
+              setSelectedReservation(data);
+            }
+          } else {
+            setReservations([...reservations, data]);
+          }
+          
+          setHasMutated(true);
+          setIsFormOpen(false);
+          setEditingReservation(undefined);
+          setCalendarSelectStart("");
+          setCalendarSelectEnd("");
+          return true;
+        } else {
+          setError(data.message || "Errore durante il salvataggio della prenotazione.");
+          return false;
+        }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setError("Errore di rete durante la connessione con il server.");
+      setError("Errore di rete o di validazione durante il salvataggio.");
       return false;
     }
   };
@@ -364,17 +594,28 @@ export default function App() {
       "Sei sicuro di voler eliminare definitivamente questa prenotazione? L'operazione non è reversibile e libererà le date nel calendario.",
       async () => {
         try {
-          const response = await fetch(`/api/reservations/${id}`, {
-            method: "DELETE"
-          });
-
-          if (response.ok) {
+          if (isSupabaseActive) {
+            const { error: sbError } = await supabase.from("reservations").delete().eq("id", id);
+            if (sbError) {
+              setError(`Errore Supabase: ${sbError.message}`);
+              return;
+            }
             setReservations(reservations.filter((r) => r.id !== id));
             setSelectedReservation(null);
             setHasMutated(true);
           } else {
-            const data = await response.json();
-            setError(data.message || "Impossibile eliminare la prenotazione.");
+            const response = await fetch(`/api/reservations/${id}`, {
+              method: "DELETE"
+            });
+
+            if (response.ok) {
+              setReservations(reservations.filter((r) => r.id !== id));
+              setSelectedReservation(null);
+              setHasMutated(true);
+            } else {
+              const data = await response.json();
+              setError(data.message || "Impossibile eliminare la prenotazione.");
+            }
           }
         } catch (err) {
           console.error(err);
@@ -387,19 +628,34 @@ export default function App() {
   // Handle Save split Default settings
   const handleSaveSettings = async (newSettings: Settings): Promise<boolean> => {
     try {
-      const response = await fetch("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newSettings)
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        setSettings(data);
+      if (isSupabaseActive) {
+        const uId = supabaseUser?.id || null;
+        const dbRow = mapSettingsToDB(newSettings, uId);
+        
+        const { data, error: sbError } = await supabase.from("settings").upsert(dbRow).select().single();
+        if (sbError) {
+          setError(`Errore Supabase: ${sbError.message}`);
+          return false;
+        }
+        
+        setSettings(mapSettingsToModel(data));
         setHasMutated(true);
         return true;
+      } else {
+        const response = await fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(newSettings)
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          setSettings(data);
+          setHasMutated(true);
+          return true;
+        }
+        return false;
       }
-      return false;
     } catch (err) {
       console.error(err);
       return false;
@@ -1153,6 +1409,7 @@ export default function App() {
             {/* TAB 5: SPLIT RATIOS SETTINGS */}
             {activeTab === "settings" && (
               <div className="max-w-xl mx-auto py-6 space-y-6">
+                <SupabaseAuthWidget onUserChange={(user) => setSupabaseUser(user)} />
                 <DriveBackupWidget
                   reservations={reservations}
                   expenses={expenses}

@@ -146,6 +146,14 @@ function getGeminiClient(): GoogleGenAI | null {
 // REST API ROUTES
 // ==========================================
 
+// Expose Supabase settings dynamically to the frontend
+app.get("/api/config", (req, res) => {
+  res.json({
+    supabaseUrl: process.env.SUPABASE_URL || "",
+    supabasePublishableKey: process.env.SUPABASE_PUBLISHABLE_KEY || ""
+  });
+});
+
 // Get all reservations
 app.get("/api/reservations", (req, res) => {
   res.json(reservations);
